@@ -1,11 +1,13 @@
-<template>
-  <main class="min-h-screen bg-slate-100 p-8">
-    <h1 class="text-4xl font-bold text-emerald-700">
-      FuelFind
-    </h1>
+<script setup>
+import AppHeader from '@/components/layout/AppHeader.vue'
+</script>
 
-    <p class="mt-4 text-lg text-slate-600">
-      Find and compare fuel prices around Heidelberg.
-    </p>
-  </main>
+<template>
+  <div
+    class="min-h-screen bg-slate-50 text-slate-950 transition-colors dark:bg-slate-950 dark:text-white"
+  >
+    <AppHeader />
+
+    <RouterView />
+  </div>
 </template>

@@ -1,31 +1,64 @@
-import Favourite from './models/Favourite.js'
-import favouriteRoutes from './routes/favouriteRoutes.js'
-import accountRoutes from './routes/accountRoutes.js'
 import 'dotenv/config'
 import express from 'express'
 import mongoose from 'mongoose'
-import session from 'express-session'
-import MongoStore from 'connect-mongo'
-import stationRoutes from './routes/stationRoutes.js'
-import ApiLimit from './models/ApiLimit.js'
 
-import authRoutes from './routes/authRoutes.js'
-import User from './models/User.js'
+import ApiLimit from './models/ApiLimit.js'
+import PriceObservation from './models/PriceObservation.js'
+
+import stationRoutes from './routes/stationRoutes.js'
+import historyRoutes from './routes/historyRoutes.js'
+import archiveRoutes from './routes/archiveRoutes.js'
+import routeRoutes from './routes/routeRoutes.js'
 
 const app = express()
 const PORT = Number(process.env.PORT) || 3000
-const isProduction = process.env.NODE_ENV === 'production'
+
+const allowedOrigins = new Set(
+  (process.env.ALLOWED_ORIGINS || '')
+    .split(',')
+    .map((origin) => origin.trim())
+    .filter(Boolean),
+)
 
 app.disable('x-powered-by')
-app.use(express.json({ limit: '10kb' }))
 
-// Prevent browsers from caching account responses.
+// Prevent browsers from caching API responses.
 app.use('/api', (req, res, next) => {
   res.set('Cache-Control', 'no-store')
   next()
 })
 
-// Check whether the backend and database are connected.
+// Preserve request protection for public POST endpoints,
+// including POST /api/routes.
+app.use('/api', (req, res, next) => {
+  const safeMethods = ['GET', 'HEAD', 'OPTIONS']
+
+  if (safeMethods.includes(req.method)) {
+    return next()
+  }
+
+  const origin = req.get('Origin')
+
+  // PowerShell may omit Origin. Browser origins must be allowed.
+  if (origin !== undefined && !allowedOrigins.has(origin)) {
+    return res.status(403).json({
+      success: false,
+      message: 'Requests from this origin are not allowed.',
+    })
+  }
+
+  if (req.get('X-FuelFind-Request') !== '1') {
+    return res.status(403).json({
+      success: false,
+      message: 'Missing or invalid FuelFind request header.',
+    })
+  }
+
+  next()
+})
+
+app.use(express.json({ limit: '10kb' }))
+
 app.get('/api/health', (req, res) => {
   const databaseConnected = mongoose.connection.readyState === 1
 
@@ -42,25 +75,33 @@ async function startServer() {
       throw new Error('MONGODB_URI is missing from backend/.env')
     }
 
-    if (
-      !process.env.SESSION_SECRET ||
-      process.env.SESSION_SECRET.length < 32
-    ) {
-      throw new Error('Add a strong SESSION_SECRET to backend/.env')
+    if (allowedOrigins.size === 0) {
+      throw new Error('ALLOWED_ORIGINS is missing from backend/.env')
     }
 
-    // Connect to MongoDB before accepting requests.
+    // Require exact origins, with no paths or trailing slashes.
+    for (const origin of allowedOrigins) {
+      const parsed = new URL(origin)
+
+      if (
+        !['http:', 'https:'].includes(parsed.protocol) ||
+        parsed.origin !== origin
+      ) {
+        throw new Error(
+          'ALLOWED_ORIGINS must contain exact HTTP or HTTPS origins.',
+        )
+      }
+    }
+
     await mongoose.connect(process.env.MONGODB_URI, {
       serverSelectionTimeoutMS: 5000,
     })
 
     console.log('MongoDB connected successfully')
 
-    // Wait for the user indexes, including unique email.
-    await User.init()
-    await Favourite.init()
-    // Create the shared request-limit record if it does not exist.
-    // Existing cooldowns are preserved when the server restarts.
+    await PriceObservation.init()
+
+    // Preserve the existing cooldown when the server restarts.
     await ApiLimit.updateOne(
       { _id: 'tankerkoenig' },
       {
@@ -71,41 +112,12 @@ async function startServer() {
       { upsert: true },
     )
 
-    // Reuse the database connection for session storage.
-    const sessionStore = MongoStore.create({
-      client: mongoose.connection.getClient(),
-      dbName: mongoose.connection.name,
-      collectionName: 'sessions',
-    })
-
-    sessionStore.on('error', () => {
-      console.error('MongoDB session storage encountered an error.')
-    })
-
-    app.use(
-      session({
-        name: 'fuelfind.sid',
-        secret: process.env.SESSION_SECRET,
-        resave: false,
-        saveUninitialized: false,
-        store: sessionStore,
-
-        cookie: {
-          httpOnly: true,
-          sameSite: 'lax',
-          secure: isProduction,
-          maxAge: 24 * 60 * 60 * 1000,
-        },
-      }),
-    )
-
-    // Session handling must be registered before these routes.
-    app.use('/api/auth', authRoutes)
+    // Only public features are connected to the application.
     app.use('/api/stations', stationRoutes)
-    app.use('/api/account', accountRoutes)
-    app.use('/api/favourites', favouriteRoutes)
+    app.use('/api/history', historyRoutes)
+    app.use('/api/archive', archiveRoutes)
+    app.use('/api/routes', routeRoutes)
 
-    // Return JSON for unknown routes.
     app.use((req, res) => {
       res.status(404).json({
         success: false,
@@ -113,7 +125,6 @@ async function startServer() {
       })
     })
 
-    // Handle unexpected errors without exposing internal details.
     app.use((error, req, res, next) => {
       if (res.headersSent) {
         return next(error)
@@ -132,6 +143,11 @@ async function startServer() {
         message = 'Request is too large.'
       }
 
+      // Do not log request data or secrets.
+      if (status === 500) {
+        console.error('API request failed:', error.name || 'Error')
+      }
+
       res.status(status).json({
         success: false,
         message,
@@ -140,6 +156,10 @@ async function startServer() {
 
     const server = app.listen(PORT, () => {
       console.log(`FuelFind backend: http://localhost:${PORT}`)
+      console.log('Public FuelFind API enabled.')
+      console.log(
+        'Account routes and background price-alert worker are not mounted.',
+      )
     })
 
     server.on('error', (error) => {
